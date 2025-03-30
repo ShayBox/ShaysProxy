@@ -1,23 +1,13 @@
-use std::io::ErrorKind;
-
 use anyhow::Result;
-use derive_config::{ConfigError, DeriveTomlConfig};
-use shaysproxy::{settings::Settings, ProxyServer};
+use shaysproxy::ProxyServer;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let settings = Settings::load().unwrap_or_else(|error| match error {
-        ConfigError::Io(error) if error.kind() == ErrorKind::NotFound => Settings::default(),
-        error => panic!("{error}"),
-    });
-    
-    settings.save()?; /* Save the settings on first run */
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_target(false)
+        .init();
 
-    ProxyServer::builder()
-        .bind_addr(settings.bind_addr)
-        .conn_addr(settings.conn_addr)
-        .build()
-        .await?
-        .start()
-        .await
+    ProxyServer::bind("0.0.0.0:25565").await?.start().await
 }

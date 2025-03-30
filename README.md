@@ -1,24 +1,15 @@
 # ShaysProxy
 
-My personal Minecraft proxy using Azalea
+My personal Minecraft TCP proxy written in Rust
 
-## TODO
+This is inspired by Ender's [stupid-mc-proxy](https://github.com/EnderKill98/stupid-mc-proxy)
 
-### Kick on Join:
+## Public Instance
 
-- PlayerInfoUpdate: java.lang.IndexOutOfBoundsException: readerIndex(33) + length(1) exceeds writerIndex(33)
-- UpdateAdvancements: io.netty.handler.codec.DecoderException: 9 elements exceeded max size of: 4
+Examples:
 
-### Kick Randomly:
-
-- SetEntityData
-
-### Bugs on Join:
-
-- Blank Tab List
-- Chat Validation (probably not)
-
-### Bugs Randomly:
-
-- Chunks (+64 Offset, Not Loading, Unloading)
-- Wrong Biomes (Grass & Sky Colors)
+- `2b2t.org.proxy.shay.tools`
+- `2b2t.org_.proxy.shay.tools` - You can optionally add an extra underscore
+- `2b2t.org_25565.proxy.shay.tools` - You can optionally add a custom port
+- `2b2t.org_25565_25.proxy.shay.tools` - You can optionally add a ms delay  
+  This can be useful for latency/lag testing, batching packets with a delay causes them to be 'compressed' into less.
