@@ -13,16 +13,25 @@ use hickory_resolver::Resolver;
 use tokio::{
     io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
     net::{lookup_host, TcpListener, TcpStream, ToSocketAddrs},
-    time::sleep,
+    task::JoinSet,
+    time::{sleep, timeout},
 };
 
 #[derive(Debug, Deref, DerefMut)]
-pub struct ProxyServer(TcpListener);
+pub struct ProxyServer {
+    #[deref]
+    #[deref_mut]
+    listener: TcpListener,
+    join_set: JoinSet<()>,
+}
 
 impl ProxyServer {
     /// Creates a new `ProxyServer` from a listener which you have already bound.
-    pub const fn from(listener: TcpListener) -> Self {
-        Self(listener)
+    pub fn from(listener: TcpListener) -> Self {
+        Self {
+            listener,
+            join_set: JoinSet::new(),
+        }
     }
 
     /// Creates a new `ProxyServer`, which will be bound to the specified address.
@@ -37,12 +46,18 @@ impl ProxyServer {
     ///
     /// # Errors
     /// Will return `Err` if `TcpListener::accept` fails.
-    pub async fn listen(&self) -> Result<()> {
-        info!("Listening on {}", self.0.local_addr()?);
+    pub async fn listen(&mut self) -> Result<()> {
+        info!("Listening on {}", self.local_addr()?);
         loop {
-            debug!("Waiting for incoming connection");
+            debug!("[{}] Waiting for incoming connection", self.join_set.len());
             let client = self.accept().await.map(ProxyClient::from)?;
-            tokio::spawn(async move { client.task().await.map_err(|error| error!("{error}")) });
+            self.join_set.spawn(async move {
+                if let Err(error) = client.task().await {
+                    error!("{error}");
+                }
+            });
+
+            while self.join_set.try_join_next().is_some() {}
         }
     }
 }
@@ -73,8 +88,8 @@ impl ProxyClient {
         info!("New connection from {}", self.socket);
 
         /* Wrap the connection and try to parse the handshake packet with Azalea */
-        let mut c2s = Connection::<ServerboundHandshakePacket, ClientboundHandshakePacket>::wrap(self.stream);
-        let ServerboundHandshakePacket::Intention(mut intention) = c2s.read().await?;
+        let mut s2c = Connection::<ServerboundHandshakePacket, ClientboundHandshakePacket>::wrap(self.stream);
+        let ServerboundHandshakePacket::Intention(mut intention) = s2c.read().await?;
 
         /* Try to parse the global wildcard subdomain and modify the handshake */
         if let Some(subdomain) = intention.host.split(".proxy.").next() {
@@ -95,10 +110,10 @@ impl ProxyClient {
         let socket = if let Ok(srv) = resolver.srv_lookup(query).await {
             let record = srv.iter().next().context("Missing srv record")?;
             let lookup = resolver.lookup_ip(record.target().to_ascii()).await?;
-            let addr = lookup.iter().next().context("Missing addr")?;
-            SocketAddr::new(addr, record.port())
+            let address = lookup.iter().next().context("Missing addr")?;
+            SocketAddr::new(address, record.port())
         } else {
-            let host = intention.host.to_string();
+            let host = format!("{}:{}", intention.host, intention.port);
             let mut hosts = lookup_host(host).await?;
             hosts.next().context("Missing server host")?
         };
@@ -108,14 +123,16 @@ impl ProxyClient {
             bail!("Recursive Connection!")
         }
 
-        /* Connect to the target server, wrap, and send the modified handshake packet */
-        let server = TcpStream::connect(socket).await?;
-        let mut s2c = Connection::<ClientboundHandshakePacket, ServerboundHandshakePacket>::wrap(server);
-        s2c.write(ServerboundHandshakePacket::Intention(intention)).await?;
+        /* Connect to the target server and wrap with Azalea */
+        let server = timeout(Duration::from_secs(10), TcpStream::connect(socket)).await??;
+        let mut c2s = Connection::<ClientboundHandshakePacket, ServerboundHandshakePacket>::wrap(server);
+        c2s.write(ServerboundHandshakePacket::Intention(intention)).await?;
 
         /* Unwrap the client and server to raw tcp streams because Azalea can't handle it */
-        let mut server = s2c.unwrap()?;
-        let mut client = c2s.unwrap()?;
+        let mut client = s2c.unwrap()?;
+        let mut server = c2s.unwrap()?;
+        client.set_nodelay(true)?;
+        server.set_nodelay(true)?;
 
         info!("Opened connection from {} -> {socket}", self.socket);
 
