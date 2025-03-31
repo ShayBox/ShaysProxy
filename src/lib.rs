@@ -9,18 +9,28 @@ use hickory_resolver::Resolver;
 use tokio::{
     io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
     net::{lookup_host, TcpListener, TcpStream, ToSocketAddrs},
+    task::JoinSet,
     time::{sleep, Duration},
 };
 
 #[derive(Debug, Deref, DerefMut)]
-pub struct ProxyServer(TcpListener);
+pub struct ProxyServer {
+    #[deref]
+    #[deref_mut]
+    pub listener: TcpListener,
+    pub join_set: JoinSet<()>,
+}
+
+impl From<TcpListener> for ProxyServer {
+    fn from(listener: TcpListener) -> Self {
+        Self {
+            listener,
+            join_set: JoinSet::new(),
+        }
+    }
+}
 
 impl ProxyServer {
-    /// Creates a new `ProxyServer` from a listener which you have already bound.
-    pub const fn from(listener: TcpListener) -> Self {
-        Self(listener)
-    }
-
     /// Creates a new `ProxyServer`, which will be bound to the specified address.
     ///
     /// # Errors
@@ -33,16 +43,20 @@ impl ProxyServer {
     ///
     /// # Errors
     /// Will return `Err` if `TcpListener::accept` fails.
-    pub async fn start(&self) -> Result<()> {
-        info!("Listening for new client connections on {}", self.local_addr()?);
+    pub async fn listen(&mut self) -> Result<()> {
+        info!("Listening on {}", self.local_addr()?);
+
         loop {
+            debug!("[{}] Waiting for incoming connection", self.join_set.len());
             let connection = self.accept().await?;
             let mut client = ProxyClient::from(connection);
-            tokio::spawn(async move {
-                if let Err(error) = client.start().await {
-                    error!("Client connection error: {error}");
+            self.join_set.spawn(async move {
+                if let Err(error) = client.task().await {
+                    error!("{error}");
                 }
             });
+
+            while self.join_set.try_join_next().is_some() {}
         }
     }
 }
@@ -52,21 +66,28 @@ pub struct ProxyClient {
     #[deref]
     #[deref_mut]
     pub stream: TcpStream,
-    pub addr:   SocketAddr,
+    pub socket: SocketAddr,
+    pub millis: Option<u64>,
+}
+
+impl From<(TcpStream, SocketAddr)> for ProxyClient {
+    fn from((stream, socket): (TcpStream, SocketAddr)) -> Self {
+        Self {
+            stream,
+            socket,
+            millis: None,
+        }
+    }
 }
 
 impl ProxyClient {
-    pub fn from((stream, addr): (TcpStream, SocketAddr)) -> Self {
-        Self { stream, addr }
-    }
-
     /// Parse the Minecraft handshake, modify, and send it, then relay the packets.
     ///
     /// # Errors
     /// Will return `Err` for a lot of reasons, I'm not explaining them all.
-    pub async fn start(&mut self) -> Result<()> {
-        let client_addr = self.addr;
-        info!("New client connection from {client_addr}");
+    pub async fn task(&mut self) -> Result<()> {
+        let client_addr = self.socket;
+        info!("Incoming connection from {client_addr}");
 
         /* Read the packet length byte */
         let mut byte = [0u8; 1];
@@ -79,36 +100,39 @@ impl ProxyClient {
 
         /* Parse the handshake packet and modify the addr and port */
         let mut handshake = HandshakePacket::try_from(bytes)?;
-        let mut delay = None;
-        if let Some(subdomain) = handshake.addr.split(".proxy.").next() {
+        /* Try to parse the global wildcard subdomain and modify the handshake */
+        if let Some(subdomain) = handshake.host.split(".proxy.").next() {
             let mut parts = subdomain.split('_').collect::<VecDeque<_>>();
-            let addr = parts.pop_front().context("Missing addr")?.parse()?;
+            let host = parts.pop_front().context("None")?.parse()?;
             let port = parts.pop_front().and_then(|port| port.parse().ok()).unwrap_or(25565);
-            delay = parts.pop_front().and_then(|millis| millis.parse().ok());
-            handshake.addr = addr;
+            if let Some(millis) = parts.pop_front() {
+                self.millis = Some(millis.parse()?);
+            }
+
+            handshake.host = host;
             handshake.port = port;
         }
 
         /* Try to resolve the srv / host to get the server address */
         let resolver = Resolver::builder_tokio()?.build();
-        let query = format!("_minecraft._tcp.{}", handshake.addr);
-        let server_addr = if let Ok(srv) = resolver.srv_lookup(query).await {
+        let query = format!("_minecraft._tcp.{}", handshake.host);
+        let socket = if let Ok(srv) = resolver.srv_lookup(query).await {
             let record = srv.iter().next().context("Missing srv record")?;
             let lookup = resolver.lookup_ip(record.target().to_ascii()).await?;
-            let addr = lookup.iter().next().context("Missing addr")?;
-            SocketAddr::new(addr, record.port())
+            let ip = lookup.iter().next().context("Missing addr")?;
+            SocketAddr::new(ip, record.port())
         } else {
             let host = handshake.to_string();
             let mut hosts = lookup_host(host).await?;
-            hosts.next().context("Missing server address")?
+            hosts.next().context("Missing server host")?
         };
 
-        if server_addr.ip() == self.addr.ip() || self.addr.to_string().starts_with("192.168") {
+        if socket.ip() == self.socket.ip() || self.socket.to_string().starts_with("192.168") {
             bail!("Recursive Connection!")
         }
 
         /* Write the modified handshake packet to the server */
-        let mut server = TcpStream::connect(server_addr).await?;
+        let mut server = TcpStream::connect(socket).await?;
         let src = TryInto::<Vec<_>>::try_into(handshake)?;
         server.write_all(&src).await?;
         server.set_nodelay(true)?;
@@ -116,16 +140,16 @@ impl ProxyClient {
 
         // TODO: Handle the status and login packets
 
-        info!("Connection from {client_addr} -> {server_addr} opened");
+        info!("Opened connection from {client_addr} <--> {socket}");
 
-        if let Some(millis) = delay {
+        if let Some(millis) = self.millis {
             self.copy_bidirectional_delay(&mut server, millis).await?;
         } else {
             let (c2s, s2c) = copy_bidirectional(&mut self.stream, &mut server).await?;
             debug!("Transferred: C2S: {c2s} bytes, S2C: {s2c} bytes");
         }
 
-        info!("Connection from {client_addr} -> {server_addr} closed");
+        info!("Closed connection from {client_addr} <--> {socket}");
 
         let _ = self.shutdown().await;
         let _ = server.shutdown().await;
@@ -167,6 +191,8 @@ impl ProxyClient {
     }
 }
 
+/* Minecraft Protocol */
+
 pub type UShort = u16;
 pub type VarInt = i32;
 pub enum State {
@@ -177,14 +203,14 @@ pub enum State {
 
 pub struct HandshakePacket {
     pver: VarInt,
-    addr: String,
+    host: String,
     port: UShort,
     next: State,
 }
 
 impl Display for HandshakePacket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.addr, self.port)
+        write!(f, "{}:{}", self.host, self.port)
     }
 }
 
@@ -201,7 +227,7 @@ impl TryFrom<Vec<u8>> for HandshakePacket {
 
         Ok(Self {
             pver: read_varint(buf).context("pver")?,
-            addr: read_string(buf).context("addr")?,
+            host: read_string(buf).context("host")?,
             port: read_ushort(buf).context("port")?,
             next: match read_varint(buf).context("next")? {
                 1 => State::Status,
@@ -220,7 +246,7 @@ impl TryInto<Vec<u8>> for HandshakePacket {
         let mut buf = Vec::new();
         buf.extend(write_varint(0x00)?);
         buf.extend(write_varint(self.pver)?);
-        buf.extend(write_string(&self.addr)?);
+        buf.extend(write_string(&self.host)?);
         buf.extend(self.port.to_be_bytes());
         buf.extend(write_varint(self.next as VarInt)?);
 

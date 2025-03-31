@@ -9,5 +9,5 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    ProxyServer::bind("0.0.0.0:25565").await?.start().await
+    ProxyServer::bind("0.0.0.0:25565").await?.listen().await
 }
