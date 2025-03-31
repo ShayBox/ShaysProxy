@@ -1,6 +1,6 @@
 [package]
 name = "shaysproxy"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Shayne Hartford <shaybox@shaybox.com>"]
 edition = "2024"
 description = "My personal Minecraft TCP proxy written in Rust"
@@ -13,6 +13,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+azalea-protocol = { git = "https://github.com/Shays-Forks/azalea.git" }
 derive_more = { version = "2", features = ["full"] }
 hickory-resolver = "0.25"
 tokio = { version = "1", features = ["full"] }
