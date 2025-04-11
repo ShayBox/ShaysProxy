@@ -1,3 +1,5 @@
+#![feature(ip)]
+
 #[macro_use]
 extern crate tracing;
 
@@ -100,7 +102,9 @@ impl ProxyClient {
 
         /* Parse the handshake packet and modify the addr and port */
         let mut handshake = HandshakePacket::try_from(bytes)?;
-        /* Try to parse the global wildcard subdomain and modify the handshake */
+        debug!("Handshake: {handshake:?}");
+
+        /* Try to parse the global wildcard subdomain and modify the handshake. */
         if let Some(subdomain) = handshake.host.split(".proxy.").next() {
             let mut parts = subdomain.split('_').collect::<VecDeque<_>>();
             let host = parts.pop_front().context("None")?.parse()?;
@@ -113,7 +117,7 @@ impl ProxyClient {
             handshake.port = port;
         }
 
-        /* Try to resolve the srv / host to get the server address */
+        /* Try to resolve the srv / host to get the server address. */
         let resolver = Resolver::builder_tokio()?.build();
         let query = format!("_minecraft._tcp.{}", handshake.host);
         let socket = if let Ok(srv) = resolver.srv_lookup(query).await {
@@ -127,13 +131,17 @@ impl ProxyClient {
             hosts.next().context("Missing server host")?
         };
 
-        if socket.ip() == self.socket.ip() || self.socket.to_string().starts_with("192.168") {
-            bail!("Recursive Connection!")
+        if socket.ip() == self.socket.ip() {
+            bail!("Recursive connection!")
+        }
+
+        if !socket.ip().is_global() {
+            bail!("Non-Global connection!")
         }
 
         /* Write the modified handshake packet to the server */
         let mut server = TcpStream::connect(socket).await?;
-        let src = TryInto::<Vec<_>>::try_into(handshake)?;
+        let src = TryInto::<Vec<_>>::try_into(&handshake)?;
         server.write_all(&src).await?;
         server.set_nodelay(true)?;
         self.set_nodelay(true)?;
@@ -195,12 +203,15 @@ impl ProxyClient {
 
 pub type UShort = u16;
 pub type VarInt = i32;
+
+#[derive(Copy, Clone, Debug)]
 pub enum State {
     Status   = 1,
     Login    = 2,
     Transfer = 3,
 }
 
+#[derive(Debug)]
 pub struct HandshakePacket {
     pver: VarInt,
     host: String,
@@ -239,7 +250,7 @@ impl TryFrom<Vec<u8>> for HandshakePacket {
     }
 }
 
-impl TryInto<Vec<u8>> for HandshakePacket {
+impl TryInto<Vec<u8>> for &'_ HandshakePacket {
     type Error = Error;
 
     fn try_into(self) -> Result<Vec<u8>, Self::Error> {
@@ -314,19 +325,19 @@ fn read_ushort(buf: &mut &[u8]) -> Result<UShort> {
 }
 
 fn write_varint(mut int: VarInt) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(5);
 
     loop {
-        let mut byte = u8::try_from(int & 0b0111_1111)?;
+        let mut byte = u8::try_from(int & 0x7F)?;
         int >>= 7;
 
-        if int != 0 {
-            byte |= 0b1000_0000;
+        if (int != 0 && int != -1) || (int == -1 && (byte & 0x40) == 0) || (int == 0 && (byte & 0x40) != 0) {
+            byte |= 0x80;
         }
 
         buf.push(byte);
 
-        if int == 0 {
+        if int == 0 || int == -1 {
             break;
         }
     }

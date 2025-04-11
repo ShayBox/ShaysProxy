@@ -1,6 +1,6 @@
 [package]
 name = "shaysproxy"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Shayne Hartford <shaybox@shaybox.com>"]
 edition = "2024"
 description = "My personal Minecraft TCP proxy written in Rust"
